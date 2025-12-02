@@ -1,0 +1,30 @@
+server:
+  listen_addr: "0.0.0.0:6432"
+  shutdown_timeout: 30s
+
+pool:
+  # Backend PostgreSQL configuration
+  backend:
+    host: "localhost"
+    port: "5432"
+    database: "db"
+    user: "postgres"
+    password: "postgres"
+  
+  # Pool mode: session, transaction, or statement
+  mode: "session"
+  
+  # Maximum number of connections in the pool
+  max_connections: 100
+  
+  # Minimum idle connections to maintain
+  min_idle_connections: 10
+  
+  # Maximum time a connection can be idle
+  max_idle_time: 10m
+  
+  # Maximum lifetime of a connection
+  max_lifetime: 1h
+  
+  # Timeout for acquiring a connection
+  acquire_timeout: 30s
