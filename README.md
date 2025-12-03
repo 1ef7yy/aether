@@ -64,12 +64,13 @@ Or with default config file location:
 ```
 
 
-## Implemented
+## Features
 
 - [x] Query forwarding
 - [ ] Session pooling
 - [ ] Transaction pooling
-- [ ] Prometheus/Otel metrics
-- [ ] Admin interface
+- [ ] SSL
 - [ ] TLS encryption
 - [ ] Prepared statements
+- [ ] Prometheus/Otel metrics
+- [ ] Admin interface

@@ -18,13 +18,11 @@ type Server struct {
 	listener net.Listener
 	pool     *pool.Pool
 	config   Config
-
-	mu      sync.RWMutex
-	clients map[*Client]struct{}
-
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	mu       sync.RWMutex
+	clients  map[*Client]struct{}
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
 }
 
 type Config struct {

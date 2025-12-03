@@ -28,20 +28,17 @@ type Config struct {
 }
 
 type Pool struct {
-	config Config
-	mu     sync.RWMutex
-
-	idle     []*backend.Connection
-	active   map[*backend.Connection]struct{}
-	connChan chan *backend.Connection
-
+	config            Config
+	mu                sync.RWMutex
+	idle              []*backend.Connection
+	active            map[*backend.Connection]struct{}
+	connChan          chan *backend.Connection
 	totalConnections  int
 	activeConnections int
 	waitingClients    int
-
-	ctx    context.Context
-	cancel context.CancelFunc
-	closed bool
+	ctx               context.Context
+	cancel            context.CancelFunc
+	closed            bool
 }
 
 func NewPool(config Config) (*Pool, error) {
