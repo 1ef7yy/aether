@@ -5,18 +5,29 @@ A high-performance PostgreSQL connection pooler written in Go, inspired by PgBou
 ## Features
 
 - **Multiple Pooling Modes**
-  - Session pooling: One server connection per client connection
+  - **Session pooling**: One server connection per client connection with automatic state reset
   - Transaction pooling: Connection returned to pool after transaction
   - Statement pooling: Connection returned after each statement
+
+- **Advanced Session Pooling** ⭐
+  - Automatic connection state reset between sessions
+  - Transaction rollback and session cleanup (`DISCARD ALL`)
+  - Connection health checks and lifecycle management
+  - Query state tracking (transactions, temp tables, prepared statements)
+  - Background maintenance and stale connection cleanup
+  - Detailed pool statistics and monitoring
+  - See [SESSION_POOLING.md](SESSION_POOLING.md) for details
 
 - **Efficient Connection Management**
   - Configurable pool size and connection limits
   - Automatic connection recycling based on idle time and lifetime
   - Connection health monitoring
+  - Adaptive pool sizing
 
 - **PostgreSQL Protocol Support**
   - Native PostgreSQL wire protocol implementation
-  - Authentication handling
+  - Authentication handling (MD5, cleartext)
+  - SSL/TLS support for client and backend connections
   - Message routing between clients and backends
 
 ## Getting Started
@@ -64,12 +75,20 @@ Or with default config file location:
 ```
 
 
-## Features
+## Feature Status
 
 - [x] Query forwarding
-- [ ] Session pooling
+- [x] **Session pooling** ⭐ (with automatic state reset)
 - [ ] Transaction pooling
-- [x] SSL
-- [ ] Prepared statements
-- [ ] Prometheus/Otel metrics
+- [x] SSL/TLS support
+- [x] Connection health checks
+- [x] Automatic connection lifecycle management
+- [x] Pool statistics and monitoring
+- [ ] Prepared statement pooling
+- [ ] Prometheus/OpenTelemetry metrics
 - [ ] Admin interface
+
+## Documentation
+
+- [Session Pooling Guide](SESSION_POOLING.md) - Comprehensive guide to session pooling features
+- [Configuration Examples](aether.yaml) - Sample configuration file

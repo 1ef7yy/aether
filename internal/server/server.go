@@ -46,6 +46,9 @@ func NewServer(config Config) (*Server, error) {
 		return nil, fmt.Errorf("failed to create pool: %w", err)
 	}
 
+	// Start pool maintenance
+	p.Start()
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Server{
@@ -306,10 +309,74 @@ func (c *Client) clientToBackend(ctx context.Context) error {
 			return nil
 		}
 
+		// Track transaction state for session pooling
+		if msg.Type == protocol.MsgQuery {
+			c.trackQueryState(msg.Data)
+		}
+
 		if err := c.backendConn.WriteMessage(msg); err != nil {
 			return fmt.Errorf("backend write error: %w", err)
 		}
 	}
+}
+
+// trackQueryState monitors queries to track transaction and session state
+func (c *Client) trackQueryState(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+
+	// Extract query text (null-terminated string)
+	queryEnd := len(data)
+	for i, b := range data {
+		if b == 0 {
+			queryEnd = i
+			break
+		}
+	}
+	query := string(data[:queryEnd])
+
+	// Simple state tracking (case-insensitive)
+	queryUpper := ""
+	if len(query) > 0 {
+		queryUpper = string(data[0:min(len(query), 20)])
+	}
+
+	// Check for transaction commands
+	if len(queryUpper) >= 5 {
+		switch queryUpper[:5] {
+		case "BEGIN", "begin", "START", "start":
+			c.backendConn.MarkInTransaction(true)
+		case "COMMI", "commi": // COMMIT
+			c.backendConn.MarkInTransaction(false)
+		case "ROLLB", "rollb": // ROLLBACK
+			c.backendConn.MarkInTransaction(false)
+		}
+	}
+
+	// Check for session-level state changes
+	if len(queryUpper) >= 3 {
+		switch queryUpper[:3] {
+		case "SET", "set":
+			c.backendConn.MarkDirty()
+		case "CRE", "cre": // CREATE TEMP TABLE
+			if len(query) > 12 {
+				temp := string(data[7:min(len(query), 11)])
+				if temp == "TEMP" || temp == "temp" {
+					c.backendConn.MarkDirty()
+				}
+			}
+		case "PRE", "pre": // PREPARE
+			c.backendConn.MarkDirty()
+		}
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (c *Client) backendToClient(ctx context.Context) error {

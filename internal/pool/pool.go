@@ -97,24 +97,66 @@ func (p *Pool) Acquire(ctx context.Context) (*backend.Connection, error) {
 	acquireCtx, cancel := context.WithTimeout(ctx, p.config.AcquireTimeout)
 	defer cancel()
 
+	// Try to get an idle connection first
 	p.mu.Lock()
 	if len(p.idle) > 0 {
 		conn := p.idle[len(p.idle)-1]
 		p.idle = p.idle[:len(p.idle)-1]
+		p.mu.Unlock()
+
+		// For session pooling mode, reset the connection state
+		if p.config.Mode == PoolModeSession {
+			if err := conn.ResetSession(acquireCtx); err != nil {
+				// If reset fails, close this connection and create a new one
+				conn.Close()
+				p.mu.Lock()
+				p.totalConnections--
+				p.mu.Unlock()
+				return p.createNewConnection(acquireCtx)
+			}
+		}
+
+		// Verify connection is still healthy
+		if !conn.IsHealthy(acquireCtx) {
+			conn.Close()
+			p.mu.Lock()
+			p.totalConnections--
+			p.mu.Unlock()
+			return p.Acquire(ctx) // Retry with a new connection
+		}
+
+		p.mu.Lock()
 		p.active[conn] = struct{}{}
 		p.activeConnections++
 		p.mu.Unlock()
+
+		conn.UpdateLastUsed()
 		return conn, nil
 	}
 
+	// Check if we can create a new connection
 	if p.totalConnections >= p.config.MaxConnections {
 		p.mu.Unlock()
+		// Wait for a released connection
 		select {
 		case conn := <-p.connChan:
 			p.mu.Lock()
 			p.active[conn] = struct{}{}
 			p.activeConnections++
 			p.mu.Unlock()
+
+			// Reset session state if in session mode
+			if p.config.Mode == PoolModeSession {
+				if err := conn.ResetSession(acquireCtx); err != nil {
+					conn.Close()
+					p.mu.Lock()
+					p.totalConnections--
+					p.mu.Unlock()
+					return p.Acquire(ctx)
+				}
+			}
+
+			conn.UpdateLastUsed()
 			return conn, nil
 		case <-acquireCtx.Done():
 			return nil, fmt.Errorf("timeout waiting for connection")
@@ -124,7 +166,12 @@ func (p *Pool) Acquire(ctx context.Context) (*backend.Connection, error) {
 	p.totalConnections++
 	p.mu.Unlock()
 
-	conn, err := backend.NewConnection(acquireCtx, p.config.Backend)
+	return p.createNewConnection(acquireCtx)
+}
+
+// createNewConnection creates a new backend connection
+func (p *Pool) createNewConnection(ctx context.Context) (*backend.Connection, error) {
+	conn, err := backend.NewConnection(ctx, p.config.Backend)
 	if err != nil {
 		p.mu.Lock()
 		p.totalConnections--
@@ -151,17 +198,88 @@ func (p *Pool) Release(conn *backend.Connection) error {
 	delete(p.active, conn)
 	p.activeConnections--
 
+	// Check connection age and health
+	state := conn.GetSessionState()
+	age := time.Since(state.CreatedAt)
+
+	// If connection exceeded max lifetime, close it
+	if age > p.config.MaxLifetime {
+		p.totalConnections--
+		return conn.Close()
+	}
+
+	// For session mode, check if connection should be reused
+	if p.config.Mode == PoolModeSession {
+		// If connection is in a bad state, close it
+		if state.InTransaction {
+			p.totalConnections--
+			return conn.Close()
+		}
+	}
+
+	// Try to return to channel first (fast path for waiting clients)
 	select {
 	case p.connChan <- conn:
 		return nil
 	default:
+		// Channel full, add to idle pool if there's room
 		if len(p.idle) < p.config.MinIdleConnections {
 			p.idle = append(p.idle, conn)
 			return nil
 		}
+		// Too many idle connections, close this one
 		p.totalConnections--
 		return conn.Close()
 	}
+}
+
+// Start begins the pool maintenance goroutine
+func (p *Pool) Start() {
+	go p.maintenanceLoop()
+}
+
+// maintenanceLoop periodically cleans up stale connections
+func (p *Pool) maintenanceLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-ticker.C:
+			p.performMaintenance()
+		}
+	}
+}
+
+// performMaintenance cleans up idle connections that have exceeded MaxIdleTime
+func (p *Pool) performMaintenance() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed {
+		return
+	}
+
+	now := time.Now()
+	validIdle := make([]*backend.Connection, 0, len(p.idle))
+
+	for _, conn := range p.idle {
+		state := conn.GetSessionState()
+		idleTime := now.Sub(state.LastUsed)
+		age := now.Sub(state.CreatedAt)
+
+		// Close connections that are too old or idle for too long
+		if age > p.config.MaxLifetime || idleTime > p.config.MaxIdleTime {
+			conn.Close()
+			p.totalConnections--
+		} else {
+			validIdle = append(validIdle, conn)
+		}
+	}
+
+	p.idle = validIdle
 }
 
 func (p *Pool) Close() error {
@@ -194,12 +312,29 @@ func (p *Pool) Stats() PoolStats {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
+	totalSessionCount := 0
+	var avgIdleTime time.Duration
+	now := time.Now()
+
+	for _, conn := range p.idle {
+		state := conn.GetSessionState()
+		totalSessionCount += state.SessionCount
+		avgIdleTime += now.Sub(state.LastUsed)
+	}
+
+	if len(p.idle) > 0 {
+		avgIdleTime = avgIdleTime / time.Duration(len(p.idle))
+	}
+
 	return PoolStats{
 		MaxConnections:    p.config.MaxConnections,
 		ActiveConnections: p.activeConnections,
 		IdleConnections:   len(p.idle),
 		WaitingClients:    p.waitingClients,
 		TotalConnections:  p.totalConnections,
+		TotalSessions:     totalSessionCount,
+		AvgIdleTime:       avgIdleTime,
+		Mode:              p.config.Mode,
 	}
 }
 
@@ -209,4 +344,7 @@ type PoolStats struct {
 	IdleConnections   int
 	WaitingClients    int
 	TotalConnections  int
+	TotalSessions     int
+	AvgIdleTime       time.Duration
+	Mode              PoolMode
 }

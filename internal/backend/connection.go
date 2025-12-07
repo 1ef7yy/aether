@@ -7,14 +7,25 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/1ef7yy/aether/internal/protocol"
 )
 
+type SessionState struct {
+	InTransaction bool
+	Dirty         bool // Has session-level state (temp tables, settings, etc.)
+	LastUsed      time.Time
+	CreatedAt     time.Time
+	SessionCount  int // Number of times this connection was reused
+}
+
 type Connection struct {
-	conn   net.Conn
-	config Config
+	conn         net.Conn
+	config       Config
+	sessionState SessionState
+	mu           sync.RWMutex
 }
 
 type Config struct {
@@ -106,6 +117,10 @@ func NewConnection(ctx context.Context, config Config) (*Connection, error) {
 	bc := &Connection{
 		conn:   conn,
 		config: config,
+		sessionState: SessionState{
+			CreatedAt: time.Now(),
+			LastUsed:  time.Now(),
+		},
 	}
 
 	if err := bc.startup(); err != nil {
@@ -229,4 +244,115 @@ func (c *Connection) ReadMessage() (*protocol.Message, error) {
 
 func (c *Connection) WriteMessage(msg *protocol.Message) error {
 	return protocol.WriteMessage(c.conn, msg)
+}
+
+// ResetSession resets the connection state for session pooling
+func (c *Connection) ResetSession(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// If we're in a transaction, roll it back
+	if c.sessionState.InTransaction {
+		if err := c.executeSimpleQuery("ROLLBACK"); err != nil {
+			return fmt.Errorf("failed to rollback transaction: %w", err)
+		}
+		c.sessionState.InTransaction = false
+	}
+
+	// If the session is dirty (has session-level state), perform DISCARD ALL
+	if c.sessionState.Dirty {
+		if err := c.executeSimpleQuery("DISCARD ALL"); err != nil {
+			return fmt.Errorf("failed to discard session state: %w", err)
+		}
+		c.sessionState.Dirty = false
+	}
+
+	c.sessionState.LastUsed = time.Now()
+	c.sessionState.SessionCount++
+
+	return nil
+}
+
+// executeSimpleQuery sends a simple query and waits for completion
+func (c *Connection) executeSimpleQuery(query string) error {
+	queryMsg := &protocol.Message{
+		Type: protocol.MsgQuery,
+		Data: append([]byte(query), 0),
+	}
+
+	if err := protocol.WriteMessage(c.conn, queryMsg); err != nil {
+		return err
+	}
+
+	// Read messages until ReadyForQuery
+	for {
+		msg, err := protocol.ReadMessage(c.conn)
+		if err != nil {
+			return err
+		}
+
+		switch msg.Type {
+		case protocol.MsgReadyForQuery:
+			return nil
+		case protocol.MsgErrorResponse:
+			return fmt.Errorf("query error: %s", string(msg.Data))
+		default:
+			// Continue reading other messages (CommandComplete, etc.)
+			continue
+		}
+	}
+}
+
+// IsHealthy checks if the connection is still healthy
+func (c *Connection) IsHealthy(ctx context.Context) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	// Check if connection is still alive
+	c.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	defer c.conn.SetReadDeadline(time.Time{})
+
+	// Try to peek at the connection
+	one := make([]byte, 1)
+	_, err := c.conn.Read(one)
+	if err == nil {
+		// We read something, which shouldn't happen in idle state
+		return false
+	}
+
+	// Check if it's a timeout (expected for healthy idle connection)
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
+	}
+
+	// Any other error means connection is broken
+	return false
+}
+
+// GetSessionState returns a copy of the session state
+func (c *Connection) GetSessionState() SessionState {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.sessionState
+}
+
+// MarkDirty marks the session as having session-level state
+func (c *Connection) MarkDirty() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sessionState.Dirty = true
+}
+
+// MarkInTransaction marks the session as being in a transaction
+func (c *Connection) MarkInTransaction(inTx bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sessionState.InTransaction = inTx
+}
+
+// UpdateLastUsed updates the last used timestamp
+func (c *Connection) UpdateLastUsed() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sessionState.LastUsed = time.Now()
 }
