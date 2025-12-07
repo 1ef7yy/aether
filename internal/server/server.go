@@ -295,6 +295,14 @@ func (c *Client) forwardStartupMessages() error {
 }
 
 func (c *Client) clientToBackend(ctx context.Context) error {
+	// Create appropriate handler based on pool mode
+	var handler interface{}
+	if c.pool.GetConfig().Mode == pool.PoolModeTransaction {
+		handler = NewTransactionHandler(c)
+	} else {
+		handler = NewSessionHandler(c)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -314,173 +322,26 @@ func (c *Client) clientToBackend(ctx context.Context) error {
 			return nil
 		}
 
-		// Handle transaction pooling
-		if c.pool.GetConfig().Mode == pool.PoolModeTransaction {
-			if err := c.handleTransactionPooling(ctx, msg); err != nil {
+		// Use appropriate handler
+		if txHandler, ok := handler.(*TransactionHandler); ok {
+			if err := txHandler.HandleMessage(ctx, msg); err != nil {
 				return err
 			}
-		} else {
-			// Session mode: just track state and forward
-			if msg.Type == protocol.MsgQuery {
-				c.trackQueryState(msg.Data)
-			}
-			if err := c.backendConn.WriteMessage(msg); err != nil {
-				return fmt.Errorf("backend write error: %w", err)
+		} else if sessionHandler, ok := handler.(*SessionHandler); ok {
+			if err := sessionHandler.HandleMessage(ctx, msg); err != nil {
+				return err
 			}
 		}
 	}
-}
-
-// trackQueryState monitors queries to track transaction and session state
-func (c *Client) trackQueryState(data []byte) {
-	if len(data) == 0 {
-		return
-	}
-
-	// Extract query text (null-terminated string)
-	queryEnd := len(data)
-	for i, b := range data {
-		if b == 0 {
-			queryEnd = i
-			break
-		}
-	}
-	query := string(data[:queryEnd])
-
-	// Simple state tracking (case-insensitive)
-	queryUpper := ""
-	if len(query) > 0 {
-		queryUpper = string(data[0:min(len(query), 20)])
-	}
-
-	// Check for transaction commands
-	if len(queryUpper) >= 5 {
-		switch queryUpper[:5] {
-		case "BEGIN", "begin", "START", "start":
-			c.backendConn.MarkInTransaction(true)
-		case "COMMI", "commi": // COMMIT
-			c.backendConn.MarkInTransaction(false)
-		case "ROLLB", "rollb": // ROLLBACK
-			c.backendConn.MarkInTransaction(false)
-		}
-	}
-
-	// Check for session-level state changes
-	if len(queryUpper) >= 3 {
-		switch queryUpper[:3] {
-		case "SET", "set":
-			c.backendConn.MarkDirty()
-		case "CRE", "cre": // CREATE TEMP TABLE
-			if len(query) > 12 {
-				temp := string(data[7:min(len(query), 11)])
-				if temp == "TEMP" || temp == "temp" {
-					c.backendConn.MarkDirty()
-				}
-			}
-		case "PRE", "pre": // PREPARE
-			c.backendConn.MarkDirty()
-		}
-	}
-}
-
-func (c *Client) extractQuery(data []byte) string {
-	if len(data) == 0 {
-		return ""
-	}
-	queryEnd := len(data)
-	for i, b := range data {
-		if b == 0 {
-			queryEnd = i
-			break
-		}
-	}
-	return string(data[:queryEnd])
-}
-
-func (c *Client) isBeginQuery(query string) bool {
-	if len(query) < 5 {
-		return false
-	}
-	q := query[:min(5, len(query))]
-	return q == "BEGIN" || q == "begin" || q == "Start" || q == "start"
-}
-
-func (c *Client) isCommitQuery(query string) bool {
-	if len(query) < 6 {
-		return false
-	}
-	q := query[:min(6, len(query))]
-	return q == "COMMIT" || q == "commit"
-}
-
-func (c *Client) isRollbackQuery(query string) bool {
-	if len(query) < 8 {
-		return false
-	}
-	q := query[:min(8, len(query))]
-	return q == "ROLLBACK" || q == "rollback"
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func (c *Client) handleTransactionPooling(ctx context.Context, msg *protocol.Message) error {
-	if msg.Type != protocol.MsgQuery {
-		// Only queries can start/end transactions
-		if c.backendConn == nil {
-			return fmt.Errorf("no backend connection (query required to start transaction)")
-		}
-		if err := c.backendConn.WriteMessage(msg); err != nil {
-			return fmt.Errorf("backend write error: %w", err)
-		}
-		return nil
-	}
-
-	queryStr := c.extractQuery(msg.Data)
-	isBegin := c.isBeginQuery(queryStr)
-	isCommit := c.isCommitQuery(queryStr)
-	isRollback := c.isRollbackQuery(queryStr)
-
-	// Acquire connection on BEGIN
-	if isBegin && !c.inTransaction {
-		backendConn, err := c.pool.Acquire(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to acquire backend connection: %w", err)
-		}
-		c.mu.Lock()
-		c.backendConn = backendConn
-		c.inTransaction = true
-		c.mu.Unlock()
-	}
-
-	// Forward the query
-	if c.backendConn == nil {
-		return fmt.Errorf("no backend connection available")
-	}
-
-	if err := c.backendConn.WriteMessage(msg); err != nil {
-		return fmt.Errorf("backend write error: %w", err)
-	}
-
-	// Release connection on COMMIT/ROLLBACK
-	if (isCommit || isRollback) && c.inTransaction {
-		c.mu.Lock()
-		if c.backendConn != nil {
-			// We need to wait for ReadyForQuery before releasing
-			// This will be handled after the backend response is forwarded
-			c.inTransaction = false
-		}
-		c.mu.Unlock()
-	}
-
-	return nil
 }
 
 func (c *Client) backendToClient(ctx context.Context) error {
+	// Create appropriate handler based on pool mode
+	var txHandler *TransactionHandler
+	if c.pool.GetConfig().Mode == pool.PoolModeTransaction {
+		txHandler = NewTransactionHandler(c)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -488,15 +349,9 @@ func (c *Client) backendToClient(ctx context.Context) error {
 		default:
 		}
 
-		// In transaction mode without an active transaction, there's no backend
-		if c.pool.GetConfig().Mode == pool.PoolModeTransaction {
-			c.mu.Lock()
-			hasBackend := c.backendConn != nil
-			c.mu.Unlock()
-			if !hasBackend {
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
+		// In transaction mode, check if we should read
+		if txHandler != nil && !txHandler.ShouldReadBackend() {
+			continue
 		}
 
 		msg, err := c.backendConn.ReadMessage()
@@ -511,14 +366,11 @@ func (c *Client) backendToClient(ctx context.Context) error {
 			return fmt.Errorf("client write error: %w", err)
 		}
 
-		// In transaction mode, release connection after ReadyForQuery when transaction ended
-		if c.pool.GetConfig().Mode == pool.PoolModeTransaction && msg.Type == protocol.MsgReadyForQuery {
-			c.mu.Lock()
-			if !c.inTransaction && c.backendConn != nil {
-				c.pool.Release(c.backendConn)
-				c.backendConn = nil
+		// Let transaction handler handle backend messages
+		if txHandler != nil {
+			if err := txHandler.HandleBackendMessage(msg); err != nil {
+				return err
 			}
-			c.mu.Unlock()
 		}
 	}
 }
