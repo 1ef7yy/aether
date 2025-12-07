@@ -17,6 +17,7 @@ type Config struct {
 type ServerConfig struct {
 	ListenAddr      string        `yaml:"listen_addr"`
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
+	TLS             TLSConfig     `yaml:"tls"`
 }
 
 type PoolConfig struct {
@@ -30,11 +31,21 @@ type PoolConfig struct {
 }
 
 type BackendConfig struct {
-	Host     string `yaml:"host"`
-	Port     string `yaml:"port"`
-	Database string `yaml:"database"`
-	User     string `yaml:"user"`
-	Password string `yaml:"password"`
+	Host     string    `yaml:"host"`
+	Port     string    `yaml:"port"`
+	Database string    `yaml:"database"`
+	User     string    `yaml:"user"`
+	Password string    `yaml:"password"`
+	TLS      TLSConfig `yaml:"tls"`
+}
+
+type TLSConfig struct {
+	Enabled            bool   `yaml:"enabled"`
+	CertFile           string `yaml:"cert_file"`
+	KeyFile            string `yaml:"key_file"`
+	CAFile             string `yaml:"ca_file"`
+	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
+	MinVersion         string `yaml:"min_version"`
 }
 
 func LoadFromFile(path string) (*Config, error) {

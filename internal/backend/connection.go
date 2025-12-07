@@ -2,8 +2,11 @@ package backend
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
+	"os"
 	"time"
 
 	"github.com/1ef7yy/aether/internal/protocol"
@@ -20,8 +23,16 @@ type Config struct {
 	Database string
 	User     string
 	Password string
+	TLS      TLSConfig
 
 	ConnectTimeout time.Duration
+}
+
+type TLSConfig struct {
+	Enabled            bool
+	CAFile             string
+	InsecureSkipVerify bool
+	MinVersion         string
 }
 
 func NewConnection(ctx context.Context, config Config) (*Connection, error) {
@@ -37,6 +48,59 @@ func NewConnection(ctx context.Context, config Config) (*Connection, error) {
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to backend %s: %w", addr, err)
+	}
+
+	if config.TLS.Enabled {
+		sslRequest := []byte{0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f}
+		if _, err := conn.Write(sslRequest); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to send SSL request: %w", err)
+		}
+
+		response := make([]byte, 1)
+		if _, err := conn.Read(response); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to read SSL response: %w", err)
+		}
+
+		if response[0] != 'S' {
+			conn.Close()
+			return nil, fmt.Errorf("backend does not support SSL")
+		}
+
+		tlsConfig := &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			ServerName: config.Host,
+		}
+
+		if config.TLS.MinVersion == "1.3" {
+			tlsConfig.MinVersion = tls.VersionTLS13
+		}
+
+		if config.TLS.CAFile != "" {
+			caCert, err := os.ReadFile(config.TLS.CAFile)
+			if err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("failed to read CA file: %w", err)
+			}
+			caCertPool := x509.NewCertPool()
+			if !caCertPool.AppendCertsFromPEM(caCert) {
+				conn.Close()
+				return nil, fmt.Errorf("failed to parse CA certificate")
+			}
+			tlsConfig.RootCAs = caCertPool
+		}
+
+		if config.TLS.InsecureSkipVerify {
+			tlsConfig.InsecureSkipVerify = true
+		}
+
+		tlsConn := tls.Client(conn, tlsConfig)
+		if err := tlsConn.Handshake(); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("TLS handshake with backend failed: %w", err)
+		}
+		conn = tlsConn
 	}
 
 	bc := &Connection{

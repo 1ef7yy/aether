@@ -69,8 +69,7 @@ Or with default config file location:
 - [x] Query forwarding
 - [ ] Session pooling
 - [ ] Transaction pooling
-- [ ] SSL
-- [ ] TLS encryption
+- [x] SSL
 - [ ] Prepared statements
 - [ ] Prometheus/Otel metrics
 - [ ] Admin interface

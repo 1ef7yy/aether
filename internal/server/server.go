@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -28,6 +29,15 @@ type Server struct {
 type Config struct {
 	ListenAddr string
 	Pool       pool.Config
+	TLS        TLSConfig
+}
+
+type TLSConfig struct {
+	Enabled    bool
+	CertFile   string
+	KeyFile    string
+	CAFile     string
+	MinVersion string
 }
 
 func NewServer(config Config) (*Server, error) {
@@ -53,8 +63,13 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to listen on %s: %w", s.config.ListenAddr, err)
 	}
 
+	if s.config.TLS.Enabled {
+		log.Printf("Aether listening on %s (TLS available)", s.config.ListenAddr)
+	} else {
+		log.Printf("Aether listening on %s", s.config.ListenAddr)
+	}
+
 	s.listener = listener
-	log.Printf("Aether listening on %s", s.config.ListenAddr)
 
 	s.wg.Add(1)
 	go s.acceptLoop()
@@ -77,7 +92,7 @@ func (s *Server) acceptLoop() {
 			}
 		}
 
-		client := NewClient(conn, s.pool)
+		client := NewClient(conn, s.pool, &s.config)
 
 		s.mu.Lock()
 		s.clients[client] = struct{}{}
@@ -138,15 +153,17 @@ func (s *Server) Shutdown(timeout time.Duration) error {
 type Client struct {
 	conn        net.Conn
 	pool        *pool.Pool
+	serverCfg   *Config
 	backendConn *backend.Connection
 	mu          sync.Mutex
 	closed      bool
 }
 
-func NewClient(conn net.Conn, pool *pool.Pool) *Client {
+func NewClient(conn net.Conn, pool *pool.Pool, serverCfg *Config) *Client {
 	return &Client{
-		conn: conn,
-		pool: pool,
+		conn:      conn,
+		pool:      pool,
+		serverCfg: serverCfg,
 	}
 }
 
@@ -164,8 +181,25 @@ func (c *Client) Handle(ctx context.Context) error {
 	}
 
 	if protocol.IsSSLRequest(startup.ProtocolVersion) {
-		if _, err := c.conn.Write([]byte{'N'}); err != nil {
-			return fmt.Errorf("failed to write SSL response: %w", err)
+		if c.serverCfg.TLS.Enabled {
+			if _, err := c.conn.Write([]byte{'S'}); err != nil {
+				return fmt.Errorf("failed to write SSL accept: %w", err)
+			}
+
+			tlsConfig, err := c.serverCfg.LoadTLSConfig()
+			if err != nil {
+				return fmt.Errorf("failed to load TLS config: %w", err)
+			}
+
+			tlsConn := tls.Server(c.conn, tlsConfig)
+			if err := tlsConn.Handshake(); err != nil {
+				return fmt.Errorf("TLS handshake failed: %w", err)
+			}
+			c.conn = tlsConn
+		} else {
+			if _, err := c.conn.Write([]byte{'N'}); err != nil {
+				return fmt.Errorf("failed to write SSL response: %w", err)
+			}
 		}
 
 		startupMsg, err = protocol.ReadStartupMessage(c.conn)
