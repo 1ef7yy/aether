@@ -104,9 +104,18 @@ func (p *Pool) Acquire(ctx context.Context) (*backend.Connection, error) {
 		p.idle = p.idle[:len(p.idle)-1]
 		p.mu.Unlock()
 
-		// For session pooling mode, reset the connection state
+		// Reset connection based on pool mode
 		if p.config.Mode == PoolModeSession {
 			if err := conn.ResetSession(acquireCtx); err != nil {
+				// If reset fails, close this connection and create a new one
+				conn.Close()
+				p.mu.Lock()
+				p.totalConnections--
+				p.mu.Unlock()
+				return p.createNewConnection(acquireCtx)
+			}
+		} else if p.config.Mode == PoolModeTransaction {
+			if err := conn.ResetTransaction(acquireCtx); err != nil {
 				// If reset fails, close this connection and create a new one
 				conn.Close()
 				p.mu.Lock()
@@ -145,9 +154,17 @@ func (p *Pool) Acquire(ctx context.Context) (*backend.Connection, error) {
 			p.activeConnections++
 			p.mu.Unlock()
 
-			// Reset session state if in session mode
+			// Reset connection state based on pool mode
 			if p.config.Mode == PoolModeSession {
 				if err := conn.ResetSession(acquireCtx); err != nil {
+					conn.Close()
+					p.mu.Lock()
+					p.totalConnections--
+					p.mu.Unlock()
+					return p.Acquire(ctx)
+				}
+			} else if p.config.Mode == PoolModeTransaction {
+				if err := conn.ResetTransaction(acquireCtx); err != nil {
 					conn.Close()
 					p.mu.Lock()
 					p.totalConnections--
@@ -208,12 +225,28 @@ func (p *Pool) Release(conn *backend.Connection) error {
 		return conn.Close()
 	}
 
-	// For session mode, check if connection should be reused
+	// Handle connection state based on pool mode
 	if p.config.Mode == PoolModeSession {
 		// If connection is in a bad state, close it
 		if state.InTransaction {
 			p.totalConnections--
 			return conn.Close()
+		}
+	} else if p.config.Mode == PoolModeTransaction {
+		// For transaction mode, rollback any active transaction
+		if state.InTransaction {
+			if err := conn.RollbackTransaction(); err != nil {
+				// If rollback fails, close the connection
+				p.totalConnections--
+				return conn.Close()
+			}
+		}
+		// Reset dirty flag for transaction mode
+		if state.Dirty {
+			if err := conn.ResetTransaction(context.Background()); err != nil {
+				p.totalConnections--
+				return conn.Close()
+			}
 		}
 	}
 
@@ -313,12 +346,14 @@ func (p *Pool) Stats() PoolStats {
 	defer p.mu.RUnlock()
 
 	totalSessionCount := 0
+	totalTransactionCount := 0
 	var avgIdleTime time.Duration
 	now := time.Now()
 
 	for _, conn := range p.idle {
 		state := conn.GetSessionState()
 		totalSessionCount += state.SessionCount
+		totalTransactionCount += state.TransactionCount
 		avgIdleTime += now.Sub(state.LastUsed)
 	}
 
@@ -333,6 +368,7 @@ func (p *Pool) Stats() PoolStats {
 		WaitingClients:    p.waitingClients,
 		TotalConnections:  p.totalConnections,
 		TotalSessions:     totalSessionCount,
+		TotalTransactions: totalTransactionCount,
 		AvgIdleTime:       avgIdleTime,
 		Mode:              p.config.Mode,
 	}
@@ -345,6 +381,7 @@ type PoolStats struct {
 	WaitingClients    int
 	TotalConnections  int
 	TotalSessions     int
+	TotalTransactions int
 	AvgIdleTime       time.Duration
 	Mode              PoolMode
 }

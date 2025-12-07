@@ -14,11 +14,12 @@ import (
 )
 
 type SessionState struct {
-	InTransaction bool
-	Dirty         bool // Has session-level state (temp tables, settings, etc.)
-	LastUsed      time.Time
-	CreatedAt     time.Time
-	SessionCount  int // Number of times this connection was reused
+	InTransaction    bool
+	Dirty            bool // Has session-level state (temp tables, settings, etc.)
+	LastUsed         time.Time
+	CreatedAt        time.Time
+	SessionCount     int // Number of times this connection was reused
+	TransactionCount int // Number of transactions executed on this connection
 }
 
 type Connection struct {
@@ -355,4 +356,83 @@ func (c *Connection) UpdateLastUsed() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sessionState.LastUsed = time.Now()
+}
+
+// ResetTransaction resets the connection for transaction pooling mode
+// Rolls back active transactions and discards all session state
+func (c *Connection) ResetTransaction(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// If we're in a transaction, roll it back
+	if c.sessionState.InTransaction {
+		if err := c.executeSimpleQuery("ROLLBACK"); err != nil {
+			return fmt.Errorf("failed to rollback transaction: %w", err)
+		}
+		c.sessionState.InTransaction = false
+	}
+
+	// For transaction pooling, we MUST discard all session state
+	// This includes temporary tables, prepared statements, session variables, etc.
+	// Each transaction should get a clean slate
+	if err := c.executeSimpleQuery("DISCARD ALL"); err != nil {
+		return fmt.Errorf("failed to discard session state: %w", err)
+	}
+
+	c.sessionState.LastUsed = time.Now()
+	c.sessionState.TransactionCount++
+	c.sessionState.Dirty = false
+
+	return nil
+}
+
+// RollbackTransaction rolls back the current transaction if one is active
+func (c *Connection) RollbackTransaction() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.sessionState.InTransaction {
+		return nil
+	}
+
+	if err := c.executeSimpleQuery("ROLLBACK"); err != nil {
+		return fmt.Errorf("failed to rollback transaction: %w", err)
+	}
+
+	c.sessionState.InTransaction = false
+	return nil
+}
+
+// BeginTransaction starts a new transaction
+func (c *Connection) BeginTransaction() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.sessionState.InTransaction {
+		return fmt.Errorf("transaction already in progress")
+	}
+
+	if err := c.executeSimpleQuery("BEGIN"); err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	c.sessionState.InTransaction = true
+	return nil
+}
+
+// CommitTransaction commits the current transaction
+func (c *Connection) CommitTransaction() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.sessionState.InTransaction {
+		return fmt.Errorf("no transaction in progress")
+	}
+
+	if err := c.executeSimpleQuery("COMMIT"); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	c.sessionState.InTransaction = false
+	return nil
 }
