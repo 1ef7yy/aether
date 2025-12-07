@@ -41,6 +41,10 @@ type Pool struct {
 	closed            bool
 }
 
+func (p *Pool) GetConfig() Config {
+	return p.config
+}
+
 func NewPool(config Config) (*Pool, error) {
 	if config.MaxConnections == 0 {
 		config.MaxConnections = 100

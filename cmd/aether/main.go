@@ -24,6 +24,13 @@ func main() {
 
 	serverCfg := server.Config{
 		ListenAddr: cfg.Server.ListenAddr,
+		TLS: server.TLSConfig{
+			Enabled:    cfg.Server.TLS.Enabled,
+			CertFile:   cfg.Server.TLS.CertFile,
+			KeyFile:    cfg.Server.TLS.KeyFile,
+			CAFile:     cfg.Server.TLS.CAFile,
+			MinVersion: cfg.Server.TLS.MinVersion,
+		},
 		Pool: pool.Config{
 			Backend: backend.Config{
 				Host:     cfg.Pool.Backend.Host,
@@ -31,6 +38,12 @@ func main() {
 				Database: cfg.Pool.Backend.Database,
 				User:     cfg.Pool.Backend.User,
 				Password: cfg.Pool.Backend.Password,
+				TLS: backend.TLSConfig{
+					Enabled:            cfg.Pool.Backend.TLS.Enabled,
+					CAFile:             cfg.Pool.Backend.TLS.CAFile,
+					InsecureSkipVerify: cfg.Pool.Backend.TLS.InsecureSkipVerify,
+					MinVersion:         cfg.Pool.Backend.TLS.MinVersion,
+				},
 			},
 			Mode:               cfg.Pool.Mode,
 			MaxConnections:     cfg.Pool.MaxConnections,
